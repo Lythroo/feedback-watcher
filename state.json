@@ -1,7 +1,11 @@
 {
  "projects": {
   "lythroo/simple-blood": {
-   "github": [],
+   "github": [
+    14,
+    15,
+    16
+   ],
    "curseforge": [
     "7833263",
     "7877810",
