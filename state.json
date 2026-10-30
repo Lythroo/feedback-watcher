@@ -58,7 +58,39 @@
     "8597647",
     "8617850",
     "8617976"
+   ],
+   "threads": {
+    "16": "1565820762042933278",
+    "15": "1565820757718605858",
+    "14": "1565820752677183644"
+   },
+   "closed": {},
+   "gh_comments": [],
+   "adopted": true,
+   "gh_since": "2026-10-30T20:30:36Z"
+  },
+  "lythroo/falling-wind": {
+   "threads": {},
+   "closed": {},
+   "gh_comments": [],
+   "adopted": true,
+   "github": [],
+   "gh_since": "2026-10-30T20:30:48Z",
+   "curseforge": [
+    "8139044",
+    "8281566",
+    "8281568",
+    "8309862",
+    "8444824"
    ]
+  },
+  "lythroo/wavelength": {
+   "threads": {},
+   "closed": {},
+   "gh_comments": [],
+   "adopted": true,
+   "github": [],
+   "gh_since": "2026-10-30T20:31:02Z"
   }
  },
  "heartbeat": "2026-10-30"
