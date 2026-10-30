@@ -1,0 +1,50 @@
+name: Watch Simple-Blood
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (GitHub may delay it a few minutes)
+  workflow_dispatch:          # lets you start it manually from the Actions tab
+
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write             # needed to save state.json (what was already posted)
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install packages
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Check GitHub issues and CurseForge comments
+        env:
+          GITHUB_WEBHOOK_URL: ${{ secrets.ISSUES_WEBHOOK }}
+          CURSEFORGE_WEBHOOK_URL: ${{ secrets.COMMENTS_WEBHOOK }}
+          GITHUB_TOKEN: ${{ github.token }}
+          HEADLESS: "false"      # real (virtual-screen) browser passes Cloudflare more often
+        run: xvfb-run -a python bot.py --once
+
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "watcher"
+          git config user.email "watcher@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "update state"
+            git pull --rebase
+            git push
+          fi
