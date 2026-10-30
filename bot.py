@@ -579,39 +579,61 @@ def sync_github_bot(p: dict, ps: dict, save, backfill: bool) -> None:
     threads = ps.setdefault("threads", {})
     closed = ps.setdefault("closed", {})
     comments_done = ps.setdefault("gh_comments", [])
+    forum_comment_done = ps.setdefault("forum_comments", {}).setdefault(forum_id, {})
     issues = fetch_issues(repo)
     open_nums = {i["number"] for i in issues}
     log.info("%s / GitHub: %d open issues", name, len(issues))
 
-    # one-time: link forum posts that the earlier webhook version created
-    if "adopted" not in ps:
-        if seen:
-            for n, tid in adopt_threads(name, forum_id).items():
-                if int(n) in seen and n not in threads:
-                    threads[n] = tid
-        ps["adopted"] = True
-        save()
+    # Reconcile against this destination forum, not only source-level "seen" state.
+    # This also migrates open issues out of a previously configured shared forum.
+    target_posts = adopt_threads(name, forum_id)
+    target_thread_ids = {t["id"] for t in forum_threads(forum_id)}
+    for n, tid in target_posts.items():
+        if int(n) in open_nums:
+            threads[n] = tid
+            closed.pop(n, None)
 
-    # 1) new issues -> one forum post each (existing GitHub comments are copied in too)
-    new = [i for i in issues if i["number"] not in seen]
+    skipped = ps.setdefault("forum_backfill_skipped", {}).setdefault(forum_id, [])
+    skipped = set(skipped)
     if first and not backfill:
-        ps["github"] = sorted(seen | {i["number"] for i in new})
+        skipped.update(str(n) for n in open_nums if str(n) not in target_posts)
+        ps["forum_backfill_skipped"][forum_id] = sorted(skipped)
+        ps["github"] = sorted(seen | open_nums)
         save()
     else:
+        source_seen = set(ps.get("github", []))
         ps.setdefault("github", [])
-        for i in new:
-            n = i["number"]
-            tid = create_post(f"[{name}] #{n} {i['title']}", issue_embed(i, name, repo),
-                              tag_ids(name, forum_id=forum_id), forum_id)
-            ps["github"].append(n)
-            threads[str(n)] = tid
-            save()
-            log.info("%s: posted issue #%s", name, n)
+        for i in issues:
+            n = str(i["number"])
+            tid = target_posts.get(n)
+            if not tid and threads.get(n) in target_thread_ids:
+                tid = threads[n]
+            if not tid:
+                if n in skipped:
+                    continue
+                tid = create_post(f"[{name}] #{n} {i['title']}", issue_embed(i, name, repo),
+                                  tag_ids(name, forum_id=forum_id), forum_id)
+                target_thread_ids.add(tid)
+                log.info("%s: posted issue #%s", name, n)
+            threads[n] = tid
+            closed.pop(n, None)
+            source_seen.add(i["number"])
+            # Track delivery per forum: a comment already sent to the old shared forum
+            # still needs to be copied into this project's new forum.
             if i.get("comments"):
+                delivered = set(forum_comment_done.get(n, []))
                 for c in fetch_issue_comments(repo, n):
-                    if c["id"] not in comments_done and say(tid, embed=gh_comment_embed(c)):
-                        comments_done.append(c["id"])
-                save()
+                    if c["id"] in delivered:
+                        continue
+                    if say(tid, embed=gh_comment_embed(c)):
+                        delivered.add(c["id"])
+                        if c["id"] not in comments_done:
+                            comments_done.append(c["id"])
+                forum_comment_done[n] = sorted(delivered)[-10000:]
+            save()
+        ps["github"] = sorted(source_seen)
+        ps["adopted"] = True
+        save()
 
     # 2) issues that were closed earlier but are open again
     for n, tid in list(closed.items()):
@@ -636,14 +658,16 @@ def sync_github_bot(p: dict, ps: dict, save, backfill: bool) -> None:
     all_ok = True
     since = ps.get("gh_since")
     if since:
-        done = set(comments_done)
         for c in fetch_repo_comments(repo, since):
             n = c["issue_url"].rsplit("/", 1)[-1]
-            if c["id"] in done or n not in threads:
+            delivered = set(forum_comment_done.get(n, []))
+            if c["id"] in delivered or n not in threads:
                 continue
             if say(threads[n], embed=gh_comment_embed(c)):
-                comments_done.append(c["id"])
-                done.add(c["id"])
+                delivered.add(c["id"])
+                forum_comment_done[n] = sorted(delivered)[-10000:]
+                if c["id"] not in comments_done:
+                    comments_done.append(c["id"])
             else:
                 all_ok = False
     if all_ok:
@@ -840,6 +864,27 @@ def sync_curseforge(p: dict, ps: dict, save, backfill: bool) -> None:
     log.info("%s / CurseForge: %d comments found", name, len(comments))
     if not comments:
         raise RuntimeError("0 comments parsed (blocked by CurseForge, the page has no comments, or the layout changed)")
+    if comments_channel:
+        destinations = ps.setdefault("curseforge_channels", {})
+        delivered = set(destinations.get(comments_channel, []))
+        if comments_channel not in destinations and not backfill:
+            destinations[comments_channel] = sorted(c["id"] for c in comments)
+            ps["curseforge"] = sorted(seen | {c["id"] for c in comments})
+            save()
+            return
+        for c in comments:
+            if c["id"] in delivered:
+                continue
+            if post_channel(comments_channel, comment_embed(c, name, url)):
+                delivered.add(c["id"])
+                seen.add(c["id"])
+                destinations[comments_channel] = sorted(delivered)[-10000:]
+                ps["curseforge"] = sorted(seen)
+                save()
+                log.info("%s: posted comment %s by %s", name, c["id"], c["author"])
+        destinations[comments_channel] = sorted(delivered)[-10000:]
+        save()
+        return
     new = [c for c in comments if c["id"] not in seen]
     if first and not backfill:
         ps["curseforge"] = sorted(seen | {c["id"] for c in new})
