@@ -1,4 +1,4 @@
-name: Watch Simple-Blood
+name: Watch mod feedback
 
 on:
   schedule:
@@ -32,6 +32,8 @@ jobs:
       - name: Check GitHub issues and CurseForge comments
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
+          DISCORD_CATEGORY_NAME: Feedback Watcher
           ISSUES_FORUM_ID: ${{ secrets.ISSUES_FORUM_ID }}
           ON_CLOSE: archive      # what to do when an issue is closed on GitHub: archive | mark | delete
           GITHUB_WEBHOOK_URL: ${{ secrets.ISSUES_WEBHOOK }}   # optional fallback, not needed with the bot
@@ -43,11 +45,12 @@ jobs:
       - name: Save state
         if: always()
         run: |
-          git config user.name "watcher"
-          git config user.email "watcher@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add state.json
           if ! git diff --cached --quiet; then
             git commit -m "update state"
             git pull --rebase
             git push
           fi
+

@@ -38,6 +38,8 @@ CF_HOOK = os.getenv("CURSEFORGE_WEBHOOK_URL", "").strip()
 GH_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()   # Discord bot (forum posts for issues)
 FORUM_ID = os.getenv("ISSUES_FORUM_ID", "").strip()       # channel ID of the #github forum
+GUILD_ID = os.getenv("DISCORD_GUILD_ID", "").strip()       # enables automatic channel provisioning
+CATEGORY_NAME = (os.getenv("DISCORD_CATEGORY_NAME", "Feedback Watcher").strip() or "Feedback Watcher")[:100]
 ON_CLOSE = os.getenv("ON_CLOSE", "archive").strip().lower()  # archive | mark | delete
 if ON_CLOSE not in ("archive", "mark", "delete"):
     ON_CLOSE = "archive"
@@ -222,9 +224,12 @@ def sync_github_webhook(p: dict, ps: dict, save, backfill: bool) -> None:
 
 # ----------------------------------------------------------------- Discord bot: one forum post per issue
 API = "https://discord.com/api/v10"
-BOT_MODE = bool(BOT_TOKEN and FORUM_ID)
-_forum: dict = {}
+BOT_MODE = bool(BOT_TOKEN and (FORUM_ID or GUILD_ID))
+MANAGED_MODE = bool(BOT_TOKEN and GUILD_ID)
+_forums: dict[str, dict] = {}
 _all_threads: dict = {}
+_managed_channels: dict[str, dict] = {}
+_dashboard: dict = {}
 
 
 class Later(Exception):
@@ -267,9 +272,125 @@ def dapi(method: str, path: str, **kw):
     return r
 
 
-def forum_info() -> dict:
-    if not _forum:
-        r = dapi("GET", f"/channels/{FORUM_ID}")
+def project_forum_id(p: dict) -> str:
+    return _managed_channels.get(project_key(p), {}).get("forum") or FORUM_ID
+
+
+def project_comments_id(p: dict) -> str | None:
+    return _managed_channels.get(project_key(p), {}).get("comments")
+
+
+def channel_slug(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9-]+", "-", name.lower()).strip("-")
+    return (slug or "project")[:70]
+
+
+def ensure_managed_channels(state: dict, projects: list[dict]) -> None:
+    """Create and reuse a tidy, bot-owned channel layout under one category."""
+    if not MANAGED_MODE:
+        return
+    saved = state.setdefault("discord", {})
+    saved_projects = saved.setdefault("projects", {})
+    r = dapi("GET", f"/guilds/{GUILD_ID}/channels")
+    if not r.ok:
+        raise RuntimeError(f"Bot cannot list server channels (HTTP {r.status_code}); check DISCORD_GUILD_ID and View Channels.")
+    channels = r.json()
+
+    category_id = saved.get("category")
+    category = next((c for c in channels if c.get("id") == category_id and c.get("type") == 4), None)
+    if not category:
+        category = next((c for c in channels if c.get("type") == 4 and c.get("name") == CATEGORY_NAME), None)
+    if not category:
+        r = dapi("POST", f"/guilds/{GUILD_ID}/channels", json={"name": CATEGORY_NAME, "type": 4})
+        if not r.ok:
+            raise RuntimeError(f"Could not create the Feedback Watcher category (HTTP {r.status_code}): {r.text[:200]}")
+        category = r.json()
+        channels.append(category)
+    saved["category"] = category["id"]
+
+    def get_or_create(name: str, kind: int, topic: str = "", tags: list[str] | None = None) -> str:
+        found = next((c for c in channels if c.get("parent_id") == category["id"]
+                      and c.get("name") == name and c.get("type") == kind), None)
+        if found:
+            return found["id"]
+        payload = {"name": name, "type": kind, "parent_id": category["id"]}
+        if topic:
+            payload["topic"] = topic[:1024]
+        if tags:
+            payload["available_tags"] = [{"name": t[:20], "moderated": False} for t in tags[:20]]
+        created = dapi("POST", f"/guilds/{GUILD_ID}/channels", json=payload)
+        if not created.ok:
+            raise RuntimeError(f"Could not create #{name} (HTTP {created.status_code}): {created.text[:200]}")
+        channels.append(created.json())
+        return created.json()["id"]
+
+    status_id = saved.get("dashboard")
+    if not any(c.get("id") == status_id and c.get("parent_id") == category["id"] and c.get("type") == 0
+               for c in channels):
+        status_id = get_or_create("watcher-dashboard", 0, "Feedback watcher status and tracked projects")
+        saved["dashboard"] = status_id
+    _dashboard["id"] = status_id
+
+    for p in projects:
+        key = project_key(p)
+        old = saved_projects.setdefault(key, {})
+        slug = channel_slug(p["name"])
+        if p.get("github"):
+            old["forum"] = get_or_create(
+                f"{slug}-issues", 15, f"GitHub issues for {p['name']} · {p['github']}",
+                [p["name"], "Bug", "Enhancement", "Question", "Closed"],
+            )
+        if p.get("curseforge"):
+            old["comments"] = get_or_create(
+                f"{slug}-comments", 0, f"New CurseForge comments for {p['name']} · {p['curseforge']}"
+            )
+        _managed_channels[key] = old
+
+    # Store channel layout before any polling so a later failure never makes duplicates.
+    save_state(state)
+
+
+def update_dashboard(state: dict, projects: list[dict]) -> None:
+    channel_id = _dashboard.get("id")
+    if not (MANAGED_MODE and channel_id):
+        return
+    lines = []
+    for p in projects:
+        sources = []
+        if p.get("github"):
+            sources.append("GitHub issues")
+        if p.get("curseforge"):
+            sources.append("CurseForge comments")
+        lines.append(f"**{p['name']}** · {' + '.join(sources)}")
+    embed = {"title": "Feedback Watcher", "description": clip("\n".join(lines) or "No projects configured.", 3800),
+             "color": 0x5865F2, "footer": {"text": "Updates automatically · issues are organized by project"},
+             "timestamp": datetime.now(timezone.utc).isoformat()}
+    discord_state = state.setdefault("discord", {})
+    message_id = discord_state.get("dashboard_message")
+    if message_id:
+        r = dapi("PATCH", f"/channels/{channel_id}/messages/{message_id}", json={"embeds": [embed]})
+        if r.ok:
+            return
+        if r.status_code != 404:
+            log.warning("could not update watcher dashboard (HTTP %s)", r.status_code)
+    r = dapi("POST", f"/channels/{channel_id}/messages", json={"embeds": [embed], "allowed_mentions": {"parse": []}})
+    if r.ok:
+        discord_state["dashboard_message"] = r.json()["id"]
+
+
+def post_channel(channel_id: str, embed: dict, content: str | None = None) -> bool:
+    payload = {"embeds": [embed], "allowed_mentions": {"parse": []}}
+    if content:
+        payload["content"] = content
+    return dapi("POST", f"/channels/{channel_id}/messages", json=payload).ok
+
+
+def forum_info(forum_id: str | None = None) -> dict:
+    forum_id = forum_id or FORUM_ID
+    if not forum_id:
+        raise RuntimeError("Set DISCORD_GUILD_ID for automatic setup or ISSUES_FORUM_ID for an existing forum.")
+    if forum_id not in _forums:
+        r = dapi("GET", f"/channels/{forum_id}")
         if r.status_code in (401, 403, 404):
             raise RuntimeError(f"Bot can't see the forum channel (HTTP {r.status_code}). Check DISCORD_BOT_TOKEN, "
                                "ISSUES_FORUM_ID and that the bot was invited to your server.")
@@ -277,18 +398,19 @@ def forum_info() -> dict:
         ch = r.json()
         if ch.get("type") not in (15, 16):
             raise RuntimeError("ISSUES_FORUM_ID is not a forum channel")
-        _forum["tags"] = {t["name"].lower(): t["id"] for t in ch.get("available_tags", [])}
-        _forum["guild"] = ch.get("guild_id")
-    return _forum
+        _forums[forum_id] = {"tags": {t["name"].lower(): t["id"] for t in ch.get("available_tags", [])},
+                             "guild": ch.get("guild_id")}
+    return _forums[forum_id]
 
 
-def tag_ids(*names: str) -> list[str]:
-    tags = forum_info()["tags"]
+def tag_ids(*names: str, forum_id: str | None = None) -> list[str]:
+    tags = forum_info(forum_id)["tags"]
     return [tags[n.lower()] for n in names if n.lower() in tags][:5]
 
 
-def create_post(title: str, embed: dict, tags: list[str]) -> str:
-    r = dapi("POST", f"/channels/{FORUM_ID}/threads", json={
+def create_post(title: str, embed: dict, tags: list[str], forum_id: str | None = None) -> str:
+    forum_id = forum_id or FORUM_ID
+    r = dapi("POST", f"/channels/{forum_id}/threads", json={
         "name": title[:100], "auto_archive_duration": 10080, "applied_tags": tags,
         "message": {"embeds": [embed], "allowed_mentions": {"parse": []}},
     })
@@ -310,7 +432,9 @@ def notify_issues(p: dict, msg: str) -> bool:
     title = f"⚠️ {p['name']} watcher alert"
     if BOT_MODE:
         try:
-            create_post(title, {"description": clip(msg, 3800), "color": 0xD29922}, tag_ids(p["name"]))
+            forum_id = project_forum_id(p)
+            create_post(title, {"description": clip(msg, 3800), "color": 0xD29922},
+                        tag_ids(p["name"], forum_id=forum_id), forum_id)
             return True
         except Exception as e:
             log.error("could not post alert via bot: %s", e)
@@ -319,21 +443,22 @@ def notify_issues(p: dict, msg: str) -> bool:
     return False
 
 
-def forum_threads() -> list[dict]:
+def forum_threads(forum_id: str | None = None) -> list[dict]:
     """All posts currently in the forum (active + archived), fetched once per run."""
-    if "all" in _all_threads:
-        return _all_threads["all"]
+    forum_id = forum_id or FORUM_ID
+    if forum_id in _all_threads:
+        return _all_threads[forum_id]
     out: list[dict] = []
     try:
-        r = dapi("GET", f"/guilds/{forum_info()['guild']}/threads/active")
+        r = dapi("GET", f"/guilds/{forum_info(forum_id)['guild']}/threads/active")
         if r.ok:
-            out += [t for t in r.json().get("threads", []) if t.get("parent_id") == FORUM_ID]
+            out += [t for t in r.json().get("threads", []) if t.get("parent_id") == forum_id]
         before = None
         for _ in range(5):
             params = {"limit": 100}
             if before:
                 params["before"] = before
-            r = dapi("GET", f"/channels/{FORUM_ID}/threads/archived/public", params=params)
+            r = dapi("GET", f"/channels/{forum_id}/threads/archived/public", params=params)
             if not r.ok:
                 break
             data = r.json()
@@ -344,14 +469,14 @@ def forum_threads() -> list[dict]:
             before = ts[-1]["thread_metadata"]["archive_timestamp"]
     except Exception as e:
         log.warning("could not list existing forum posts: %s", e)
-    _all_threads["all"] = out
+    _all_threads[forum_id] = out
     return out
 
 
-def adopt_threads(name: str) -> dict:
+def adopt_threads(name: str, forum_id: str | None = None) -> dict:
     """Link posts made earlier by the webhook version: '[Name] #12 title' -> post id."""
     pat = re.compile(rf"^\[{re.escape(name)}\] #(\d+) ")
-    return {m.group(1): t["id"] for t in forum_threads() if (m := pat.match(t.get("name", "")))}
+    return {m.group(1): t["id"] for t in forum_threads(forum_id) if (m := pat.match(t.get("name", "")))}
 
 
 def gh_issue(repo: str, n) -> tuple[int, dict | None]:
@@ -399,7 +524,8 @@ def closed_embed(issue: dict, name: str, repo: str) -> dict:
     return e
 
 
-def handle_closed(name: str, repo: str, n: str, tid: str, issue: dict | None, ps: dict) -> None:
+def handle_closed(name: str, repo: str, n: str, tid: str, issue: dict | None, ps: dict,
+                  forum_id: str | None = None) -> None:
     threads, closed = ps["threads"], ps["closed"]
     if ON_CLOSE == "delete":
         r = dapi("DELETE", f"/channels/{tid}")
@@ -421,7 +547,7 @@ def handle_closed(name: str, repo: str, n: str, tid: str, issue: dict | None, ps
         return
     threads.pop(n, None)  # move first, so a failed archive below can never cause a second "closed" message
     closed[n] = tid
-    patch = {"applied_tags": tag_ids(name, "Closed")}
+    patch = {"applied_tags": tag_ids(name, "Closed", forum_id=forum_id)}
     if ON_CLOSE == "archive":
         patch.update(archived=True, locked=True)
     r = dapi("PATCH", f"/channels/{tid}", json=patch)
@@ -430,9 +556,11 @@ def handle_closed(name: str, repo: str, n: str, tid: str, issue: dict | None, ps
     log.info("%s: closed issue #%s (%s)", name, n, ON_CLOSE)
 
 
-def handle_reopened(name: str, repo: str, issue: dict, n: str, tid: str, ps: dict) -> None:
+def handle_reopened(name: str, repo: str, issue: dict, n: str, tid: str, ps: dict,
+                    forum_id: str | None = None) -> None:
     ps["closed"].pop(n, None)
-    r = dapi("PATCH", f"/channels/{tid}", json={"archived": False, "locked": False, "applied_tags": tag_ids(name)})
+    r = dapi("PATCH", f"/channels/{tid}", json={"archived": False, "locked": False,
+                                                   "applied_tags": tag_ids(name, forum_id=forum_id)})
     if r.status_code == 404:
         return
     dapi("PATCH", f"/channels/{tid}/messages/{tid}", json={"embeds": [issue_embed(issue, name, repo)]})
@@ -443,7 +571,8 @@ def handle_reopened(name: str, repo: str, issue: dict, n: str, tid: str, ps: dic
 
 def sync_github_bot(p: dict, ps: dict, save, backfill: bool) -> None:
     repo, name = p["github"], p["name"]
-    forum_info()  # fail early with a clear message if the bot/forum setup is wrong
+    forum_id = project_forum_id(p)
+    forum_info(forum_id)  # fail early with a clear message if the bot/forum setup is wrong
     started = (datetime.now(timezone.utc) - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
     first = "github" not in ps
     seen = set(ps.get("github", []))
@@ -457,7 +586,7 @@ def sync_github_bot(p: dict, ps: dict, save, backfill: bool) -> None:
     # one-time: link forum posts that the earlier webhook version created
     if "adopted" not in ps:
         if seen:
-            for n, tid in adopt_threads(name).items():
+            for n, tid in adopt_threads(name, forum_id).items():
                 if int(n) in seen and n not in threads:
                     threads[n] = tid
         ps["adopted"] = True
@@ -472,7 +601,8 @@ def sync_github_bot(p: dict, ps: dict, save, backfill: bool) -> None:
         ps.setdefault("github", [])
         for i in new:
             n = i["number"]
-            tid = create_post(f"[{name}] #{n} {i['title']}", issue_embed(i, name, repo), tag_ids(name))
+            tid = create_post(f"[{name}] #{n} {i['title']}", issue_embed(i, name, repo),
+                              tag_ids(name, forum_id=forum_id), forum_id)
             ps["github"].append(n)
             threads[str(n)] = tid
             save()
@@ -487,7 +617,7 @@ def sync_github_bot(p: dict, ps: dict, save, backfill: bool) -> None:
     for n, tid in list(closed.items()):
         issue = next((i for i in issues if i["number"] == int(n)), None)
         if issue:
-            handle_reopened(name, repo, issue, n, tid, ps)
+            handle_reopened(name, repo, issue, n, tid, ps, forum_id)
             save()
 
     # 3) tracked issues that are no longer open -> closed handling
@@ -499,7 +629,7 @@ def sync_github_bot(p: dict, ps: dict, save, backfill: bool) -> None:
             issue = None
         elif code != 200 or issue.get("state") != "closed":
             continue  # unclear right now, try again next run
-        handle_closed(name, repo, n, tid, issue, ps)
+        handle_closed(name, repo, n, tid, issue, ps, forum_id)
         save()
 
     # 4) new GitHub comments on open issues -> into their forum post
@@ -699,7 +829,8 @@ def comment_embed(c: dict, name: str, cf_url: str) -> dict:
 
 
 def sync_curseforge(p: dict, ps: dict, save, backfill: bool) -> None:
-    if not CF_HOOK:
+    comments_channel = project_comments_id(p)
+    if not comments_channel and not CF_HOOK:
         log.warning("CURSEFORGE_WEBHOOK_URL not set, skipping CurseForge")
         return
     url, name = p["curseforge"], p["name"]
@@ -716,7 +847,9 @@ def sync_curseforge(p: dict, ps: dict, save, backfill: bool) -> None:
         return
     ps.setdefault("curseforge", [])
     for c in new:
-        if post_webhook(CF_HOOK, f"{name} · Comments", embed=comment_embed(c, name, url)):
+        sent = (post_channel(comments_channel, comment_embed(c, name, url)) if comments_channel
+                else post_webhook(CF_HOOK, f"{name} · Comments", embed=comment_embed(c, name, url)))
+        if sent:
             ps["curseforge"].append(c["id"])
             save()
             log.info("%s: posted comment %s by %s", name, c["id"], c["author"])
@@ -735,6 +868,9 @@ def alert(p: dict, kind: str, ps: dict, err: Exception | None) -> None:
     msg = f"⚠️ {p['name']}: the {label} check is failing: {str(err)[:300]}\nI'll stay quiet until it works again."
     if kind == "github":
         sent = notify_issues(p, msg)
+    elif project_comments_id(p):
+        sent = post_channel(project_comments_id(p), {"title": "⚠️ CurseForge watcher alert",
+                          "description": clip(msg, 3800), "color": 0xD29922})
     else:
         sent = bool(CF_HOOK) and post_webhook(CF_HOOK, "Watcher", content=msg)
     if sent:
@@ -744,6 +880,7 @@ def alert(p: dict, kind: str, ps: dict, err: Exception | None) -> None:
 def run_once(backfill: bool) -> None:
     state = load_state()
     projects = load_projects()
+    ensure_managed_channels(state, projects)
     migrate_state(state, project_key(projects[0]))
     save = lambda: save_state(state)
     cf_blocked = False  # if Cloudflare blocks once, don't waste time retrying the other projects this run
@@ -772,6 +909,7 @@ def run_once(backfill: bool) -> None:
             save()
 
     state["heartbeat"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    update_dashboard(state, projects)
     save()
 
 
@@ -779,14 +917,32 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--test", action="store_true")
+    ap.add_argument("--setup", action="store_true", help="create or reconcile the managed Discord layout, then exit")
     ap.add_argument("--no-backfill", action="store_true")
     ap.add_argument("--debug-curseforge", nargs="?", const="", metavar="NAME")
     a = ap.parse_args()
 
+    if a.setup:
+        if not MANAGED_MODE:
+            sys.exit("Set DISCORD_BOT_TOKEN and DISCORD_GUILD_ID to enable automatic Discord setup.")
+        state = load_state()
+        projects = load_projects()
+        ensure_managed_channels(state, projects)
+        update_dashboard(state, projects)
+        save_state(state)
+        print(f"Discord layout ready under the {CATEGORY_NAME!r} category.")
+        return
+
     if a.test:
-        if BOT_MODE:
+        if MANAGED_MODE:
+            state = load_state()
+            projects = load_projects()
+            ensure_managed_channels(state, projects)
+        if BOT_MODE and (FORUM_ID or any(p.get("github") for p in load_projects())):
             try:
-                tid = create_post("Watcher test", {"description": "✅ Bot works. Deleting this post again...", "color": 0x2DA44E}, [])
+                p = next((x for x in load_projects() if x.get("github")), None)
+                forum_id = project_forum_id(p) if p else FORUM_ID
+                tid = create_post("Watcher test", {"description": "✅ Bot works. Deleting this post again...", "color": 0x2DA44E}, [], forum_id)
                 r = dapi("DELETE", f"/channels/{tid}")
                 print("Issues (bot) ->", "ok" if r.ok else f"created, but could not delete it (HTTP {r.status_code}): bot needs 'Manage Threads'")
             except Exception as e:
@@ -795,7 +951,7 @@ def main() -> None:
             ok = post_webhook(GH_HOOK, "Watcher · Issues", content="✅ Test message: webhook works.", thread_name="Watcher test")
             print("Issues (webhook) ->", "ok" if ok else "FAILED")
         else:
-            print("Issues -> neither DISCORD_BOT_TOKEN+ISSUES_FORUM_ID nor a webhook set")
+            print("Issues -> no GitHub project or issue forum configured")
         if CF_HOOK:
             print("Comments ->", "ok" if post_webhook(CF_HOOK, "Watcher · Comments", content="✅ Test message: webhook works.") else "FAILED")
         else:
@@ -831,3 +987,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(0)
+

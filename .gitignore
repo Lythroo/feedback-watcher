@@ -2,3 +2,4 @@ browser_profile/
 debug_*
 __pycache__/
 .env
+
