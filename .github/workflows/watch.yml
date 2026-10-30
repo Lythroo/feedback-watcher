@@ -31,7 +31,10 @@ jobs:
 
       - name: Check GitHub issues and CurseForge comments
         env:
-          GITHUB_WEBHOOK_URL: ${{ secrets.ISSUES_WEBHOOK }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          ISSUES_FORUM_ID: ${{ secrets.ISSUES_FORUM_ID }}
+          ON_CLOSE: archive      # what to do when an issue is closed on GitHub: archive | mark | delete
+          GITHUB_WEBHOOK_URL: ${{ secrets.ISSUES_WEBHOOK }}   # optional fallback, not needed with the bot
           CURSEFORGE_WEBHOOK_URL: ${{ secrets.COMMENTS_WEBHOOK }}
           GITHUB_TOKEN: ${{ github.token }}
           HEADLESS: "false"      # real (virtual-screen) browser passes Cloudflare more often
