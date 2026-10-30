@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Simple-Blood watcher
-  GitHub open issues  ->  Discord #github channel      (via webhook)
-  CurseForge comments ->  Discord #curseforge channel  (via webhook)
+Feedback watcher: for every project listed in projects.json
+  GitHub open issues  ->  Discord webhook "issues"
+  CurseForge comments ->  Discord webhook "comments"
 
 Usage:
-  python bot.py                    run forever, poll every POLL_MINUTES
-  python bot.py --once             run one check and exit (for cron / testing)
-  python bot.py --test             send a test message to both webhooks
-  python bot.py --no-backfill      first run: mark everything as seen, only post NEW things
-  python bot.py --debug-curseforge scrape comments, save debug files, post nothing
+  python bot.py                      run forever, poll every POLL_MINUTES
+  python bot.py --once               run one check and exit (used by GitHub Actions)
+  python bot.py --test               send a test message to both webhooks
+  python bot.py --no-backfill        first run of a project: mark everything as seen, post only NEW things
+  python bot.py --debug-curseforge [NAME]   scrape one project's comments, save debug files, post nothing
 """
 import argparse
 import hashlib
@@ -33,8 +33,6 @@ except ImportError:
     pass
 
 # ----------------------------------------------------------------- config
-GITHUB_REPO = os.getenv("GITHUB_REPO", "Lythroo/Simple-Blood")
-CF_URL = os.getenv("CURSEFORGE_URL", "https://www.curseforge.com/minecraft/mc-mods/simple-blood").rstrip("/")
 GH_HOOK = os.getenv("GITHUB_WEBHOOK_URL", "").strip()
 CF_HOOK = os.getenv("CURSEFORGE_WEBHOOK_URL", "").strip()
 GH_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
@@ -45,9 +43,36 @@ CF_MAX_SCROLLS = int(os.getenv("CF_MAX_SCROLLS", "12"))
 BASE = Path(__file__).resolve().parent
 STATE_FILE = BASE / "state.json"
 PROFILE_DIR = BASE / "browser_profile"
+PROJECTS_FILE = BASE / "projects.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("watcher")
+
+
+class Blocked(RuntimeError):
+    """CurseForge (Cloudflare) refused to show the page."""
+
+
+# ----------------------------------------------------------------- projects
+def load_projects() -> list[dict]:
+    if PROJECTS_FILE.exists():
+        projects = json.loads(PROJECTS_FILE.read_text("utf-8"))
+    else:  # old single-project setup
+        projects = [{
+            "name": "Simple Blood",
+            "github": os.getenv("GITHUB_REPO", "Lythroo/Simple-Blood"),
+            "curseforge": os.getenv("CURSEFORGE_URL", "https://www.curseforge.com/minecraft/mc-mods/simple-blood"),
+        }]
+    for p in projects:
+        p["curseforge"] = (p.get("curseforge") or "").rstrip("/") or None
+        p["github"] = (p.get("github") or "").strip() or None
+        if not (p["github"] or p["curseforge"]):
+            raise ValueError(f"project {p.get('name')!r} needs a 'github' and/or 'curseforge' entry")
+    return projects
+
+
+def project_key(p: dict) -> str:
+    return (p["github"] or p["curseforge"]).lower()
 
 
 # ----------------------------------------------------------------- state
@@ -66,9 +91,20 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_FILE)
 
 
+def migrate_state(state: dict, first_key: str) -> None:
+    """Old single-project state.json -> per-project layout (keeps history, no re-posting)."""
+    if "github" in state or "curseforge" in state:
+        ps = state.setdefault("projects", {}).setdefault(first_key, {})
+        for k in ("github", "curseforge"):
+            if k in state:
+                ps[k] = state.pop(k)
+    for k in ("alert_GitHub", "alert_CurseForge"):
+        state.pop(k, None)
+
+
 # ----------------------------------------------------------------- discord
 def post_webhook(hook: str, username: str, embed: dict | None = None, content: str | None = None) -> bool:
-    payload = {"username": username, "allowed_mentions": {"parse": []}}
+    payload = {"username": username[:80], "allowed_mentions": {"parse": []}}
     if embed:
         payload["embeds"] = [embed]
     if content:
@@ -102,14 +138,14 @@ def clip(text: str, n: int) -> str:
 
 
 # ----------------------------------------------------------------- GitHub
-def fetch_issues() -> list[dict]:
+def fetch_issues(repo: str) -> list[dict]:
     headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
     if GH_TOKEN:
         headers["Authorization"] = f"Bearer {GH_TOKEN}"
     out, page = [], 1
     while True:
         r = requests.get(
-            f"https://api.github.com/repos/{GITHUB_REPO}/issues",
+            f"https://api.github.com/repos/{repo}/issues",
             params={"state": "open", "per_page": 100, "page": page},
             headers=headers,
             timeout=30,
@@ -123,9 +159,10 @@ def fetch_issues() -> list[dict]:
     return sorted(out, key=lambda i: i["number"])
 
 
-def issue_embed(i: dict) -> dict:
+def issue_embed(i: dict, name: str, repo: str) -> dict:
     labels = ", ".join(l["name"] for l in i.get("labels", [])) or "—"
     assignees = ", ".join(a["login"] for a in i.get("assignees", [])) or "—"
+    updated = int(datetime.fromisoformat(i["updated_at"].replace("Z", "+00:00")).timestamp())
     fields = [
         {"name": "Labels", "value": clip(labels, 1000), "inline": True},
         {"name": "Assignees", "value": clip(assignees, 1000), "inline": True},
@@ -133,7 +170,7 @@ def issue_embed(i: dict) -> dict:
     ]
     if i.get("milestone"):
         fields.append({"name": "Milestone", "value": i["milestone"]["title"], "inline": True})
-    fields.append({"name": "Updated", "value": f"<t:{int(datetime.fromisoformat(i['updated_at'].replace('Z', '+00:00')).timestamp())}:R>", "inline": True})
+    fields.append({"name": "Updated", "value": f"<t:{updated}:R>", "inline": True})
     return {
         "title": clip(f"#{i['number']} {i['title']}", 256),
         "url": i["html_url"],
@@ -142,29 +179,30 @@ def issue_embed(i: dict) -> dict:
         "author": {"name": i["user"]["login"], "url": i["user"]["html_url"], "icon_url": i["user"]["avatar_url"]},
         "fields": fields,
         "timestamp": i["created_at"],
-        "footer": {"text": f"GitHub · {GITHUB_REPO}"},
+        "footer": {"text": f"{name} · GitHub · {repo}"},
     }
 
 
-def sync_github(state: dict, backfill: bool) -> None:
+def sync_github(p: dict, ps: dict, save, backfill: bool) -> None:
     if not GH_HOOK:
         log.warning("GITHUB_WEBHOOK_URL not set, skipping GitHub")
         return
-    first = "github" not in state
-    seen = set(state.get("github", []))
-    issues = fetch_issues()
-    log.info("GitHub: %d open issues", len(issues))
+    repo, name = p["github"], p["name"]
+    first = "github" not in ps
+    seen = set(ps.get("github", []))
+    issues = fetch_issues(repo)
+    log.info("%s / GitHub: %d open issues", name, len(issues))
     new = [i for i in issues if i["number"] not in seen]
     if first and not backfill:
-        state["github"] = sorted(seen | {i["number"] for i in new})
-        save_state(state)
+        ps["github"] = sorted(seen | {i["number"] for i in new})
+        save()
         return
-    state.setdefault("github", [])
+    ps.setdefault("github", [])
     for i in new:
-        if post_webhook(GH_HOOK, "GitHub Issues", embed=issue_embed(i)):
-            state["github"].append(i["number"])
-            save_state(state)
-            log.info("posted issue #%s", i["number"])
+        if post_webhook(GH_HOOK, f"{name} · Issues", embed=issue_embed(i, name, repo)):
+            ps["github"].append(i["number"])
+            save()
+            log.info("%s: posted issue #%s", name, i["number"])
 
 
 # ----------------------------------------------------------------- CurseForge
@@ -252,7 +290,7 @@ def dom_fallback(page) -> list[dict]:
     return out
 
 
-def scrape_comments(debug: bool = False) -> list[dict]:
+def scrape_comments(cf_url: str, tag: str = "debug", debug: bool = False) -> list[dict]:
     from playwright.sync_api import sync_playwright
 
     responses = []
@@ -264,14 +302,14 @@ def scrape_comments(debug: bool = False) -> list[dict]:
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.on("response", lambda r: responses.append(r) if r.request.resource_type in ("xhr", "fetch") else None)
-            page.goto(f"{CF_URL}/comments", wait_until="domcontentloaded", timeout=60000)
+            page.goto(f"{cf_url}/comments", wait_until="domcontentloaded", timeout=60000)
 
             for _ in range(30):  # wait out a Cloudflare "Just a moment..." check
                 if "just a moment" not in page.title().lower():
                     break
                 page.wait_for_timeout(2000)
             else:
-                raise RuntimeError("Blocked by Cloudflare. Run once with HEADLESS=false and solve the check; it is remembered afterwards.")
+                raise Blocked("Blocked by Cloudflare. Run once with HEADLESS=false and solve the check; it is remembered afterwards.")
 
             page.wait_for_timeout(4000)
             last = -1
@@ -303,8 +341,8 @@ def scrape_comments(debug: bool = False) -> list[dict]:
                 found = dom_fallback(page)
 
             if debug:
-                (BASE / "debug_comments.html").write_text(page.content(), "utf-8")
-                (BASE / "debug_network.json").write_text(
+                (BASE / f"debug_{tag}_comments.html").write_text(page.content(), "utf-8")
+                (BASE / f"debug_{tag}_network.json").write_text(
                     json.dumps([{"url": u, "data": d} for u, d in blobs], indent=1)[:5_000_000], "utf-8")
         finally:
             ctx.close()
@@ -318,14 +356,14 @@ def scrape_comments(debug: bool = False) -> list[dict]:
     return comments
 
 
-def comment_embed(c: dict) -> dict:
+def comment_embed(c: dict, name: str, cf_url: str) -> dict:
     title = f"Reply by {c['author']}" if c["reply_to"] else f"New comment by {c['author']}"
     e = {
         "title": clip(title, 256),
-        "url": f"{CF_URL}/comments",
+        "url": f"{cf_url}/comments",
         "description": clip(c["text"], 3800),
         "color": 0xF16436,
-        "footer": {"text": "CurseForge · Simple Blood"},
+        "footer": {"text": f"{name} · CurseForge"},
     }
     if c["reply_to"]:
         e["fields"] = [{"name": "In reply to", "value": clip(c["reply_to"], 200), "inline": True}]
@@ -336,54 +374,72 @@ def comment_embed(c: dict) -> dict:
     return e
 
 
-def sync_curseforge(state: dict, backfill: bool) -> None:
+def sync_curseforge(p: dict, ps: dict, save, backfill: bool) -> None:
     if not CF_HOOK:
         log.warning("CURSEFORGE_WEBHOOK_URL not set, skipping CurseForge")
         return
-    first = "curseforge" not in state
-    seen = set(state.get("curseforge", []))
-    comments = scrape_comments()
-    log.info("CurseForge: %d comments found", len(comments))
+    url, name = p["curseforge"], p["name"]
+    first = "curseforge" not in ps
+    seen = set(ps.get("curseforge", []))
+    comments = scrape_comments(url, tag=re.sub(r"\W+", "_", name.lower()))
+    log.info("%s / CurseForge: %d comments found", name, len(comments))
     if not comments:
-        raise RuntimeError("0 comments parsed (blocked by CurseForge, or the page layout changed)")
+        raise RuntimeError("0 comments parsed (blocked by CurseForge, the page has no comments, or the layout changed)")
     new = [c for c in comments if c["id"] not in seen]
     if first and not backfill:
-        state["curseforge"] = sorted(seen | {c["id"] for c in new})
-        save_state(state)
+        ps["curseforge"] = sorted(seen | {c["id"] for c in new})
+        save()
         return
-    state.setdefault("curseforge", [])
+    ps.setdefault("curseforge", [])
     for c in new:
-        if post_webhook(CF_HOOK, "CurseForge Comments", embed=comment_embed(c)):
-            state["curseforge"].append(c["id"])
-            save_state(state)
-            log.info("posted comment %s by %s", c["id"], c["author"])
+        if post_webhook(CF_HOOK, f"{name} · Comments", embed=comment_embed(c, name, url)):
+            ps["curseforge"].append(c["id"])
+            save()
+            log.info("%s: posted comment %s by %s", name, c["id"], c["author"])
 
 
 # ----------------------------------------------------------------- main
-def alert(name: str, state: dict, err: Exception | None) -> None:
+def alert(p: dict, kind: str, ps: dict, err: Exception | None) -> None:
     """Post ONE warning to the channel when a source starts failing; stay quiet until it recovers."""
-    key = f"alert_{name}"
-    hook = GH_HOOK if name == "GitHub" else CF_HOOK
+    key = f"alert_{kind}"
+    hook = GH_HOOK if kind == "github" else CF_HOOK
     if err is None:
-        state.pop(key, None)
-    elif hook and not state.get(key):
-        msg = f"⚠️ The {name} check is failing: {str(err)[:300]}\nI'll stay quiet until it works again."
+        ps.pop(key, None)
+    elif hook and not ps.get(key):
+        label = "GitHub" if kind == "github" else "CurseForge"
+        msg = f"⚠️ {p['name']}: the {label} check is failing: {str(err)[:300]}\nI'll stay quiet until it works again."
         if post_webhook(hook, "Watcher", content=msg):
-            state[key] = True
+            ps[key] = True
 
 
 def run_once(backfill: bool) -> None:
     state = load_state()
-    for name, fn in (("GitHub", sync_github), ("CurseForge", sync_curseforge)):
-        err = None
-        try:
-            fn(state, backfill)
-        except Exception as e:  # one source failing must never stop the other
-            log.error("%s check failed: %s", name, e)
-            err = e
-        alert(name, state, err)
+    projects = load_projects()
+    migrate_state(state, project_key(projects[0]))
+    save = lambda: save_state(state)
+    cf_blocked = False  # if Cloudflare blocks once, don't waste time retrying the other projects this run
+
+    for p in projects:
+        ps = state.setdefault("projects", {}).setdefault(project_key(p), {})
+        jobs = []
+        if p["github"]:
+            jobs.append(("github", sync_github))
+        if p["curseforge"] and not cf_blocked:
+            jobs.append(("curseforge", sync_curseforge))
+        for kind, fn in jobs:
+            err = None
+            try:
+                fn(p, ps, save, backfill)
+            except Exception as e:  # one source failing must never stop the others
+                log.error("%s / %s check failed: %s", p["name"], kind, e)
+                err = e
+                if isinstance(e, Blocked):
+                    cf_blocked = True
+            alert(p, kind, ps, err)
+            save()
+
     state["heartbeat"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    save_state(state)
+    save()
 
 
 def main() -> None:
@@ -391,20 +447,26 @@ def main() -> None:
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--test", action="store_true")
     ap.add_argument("--no-backfill", action="store_true")
-    ap.add_argument("--debug-curseforge", action="store_true")
+    ap.add_argument("--debug-curseforge", nargs="?", const="", metavar="NAME")
     a = ap.parse_args()
 
     if a.test:
-        for hook, who in ((GH_HOOK, "GitHub Issues"), (CF_HOOK, "CurseForge Comments")):
+        for hook, who in ((GH_HOOK, "Issues"), (CF_HOOK, "Comments")):
             if hook:
-                print(who, "->", "ok" if post_webhook(hook, who, content="✅ Test message: webhook works.") else "FAILED")
+                print(who, "->", "ok" if post_webhook(hook, f"Watcher · {who}", content="✅ Test message: webhook works.") else "FAILED")
             else:
-                print(who, "-> webhook URL missing in .env")
+                print(who, "-> webhook URL missing")
         return
 
-    if a.debug_curseforge:
-        cs = scrape_comments(debug=True)
-        print(f"Parsed {len(cs)} comments. Debug files saved: debug_comments.html, debug_network.json")
+    if a.debug_curseforge is not None:
+        cands = [p for p in load_projects() if p["curseforge"]]
+        want = a.debug_curseforge.lower()
+        p = next((x for x in cands if want in x["name"].lower()), cands[0] if cands else None)
+        if not p:
+            sys.exit("No project with a CurseForge URL in projects.json")
+        tag = re.sub(r"\W+", "_", p["name"].lower())
+        cs = scrape_comments(p["curseforge"], tag=tag, debug=True)
+        print(f"{p['name']}: parsed {len(cs)} comments. Debug files saved: debug_{tag}_comments.html, debug_{tag}_network.json")
         for c in cs[:5]:
             print(f"- {c['author']}: {c['text'][:80]!r}")
         return
