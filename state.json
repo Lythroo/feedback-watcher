@@ -67,7 +67,7 @@
    "closed": {},
    "gh_comments": [],
    "adopted": true,
-   "gh_since": "2026-10-30T20:30:36Z"
+   "gh_since": "2026-10-30T20:57:21Z"
   },
   "lythroo/falling-wind": {
    "threads": {},
@@ -75,7 +75,7 @@
    "gh_comments": [],
    "adopted": true,
    "github": [],
-   "gh_since": "2026-10-30T20:30:48Z",
+   "gh_since": "2026-10-30T20:57:38Z",
    "curseforge": [
     "8139044",
     "8281566",
@@ -90,8 +90,26 @@
    "gh_comments": [],
    "adopted": true,
    "github": [],
-   "gh_since": "2026-10-30T20:31:02Z"
+   "gh_since": "2026-10-30T20:57:50Z"
   }
  },
- "heartbeat": "2026-10-30"
+ "heartbeat": "2026-10-30",
+ "discord": {
+  "projects": {
+   "lythroo/simple-blood": {
+    "forum": "1565832489048744137",
+    "comments": "1565832492315840783"
+   },
+   "lythroo/falling-wind": {
+    "forum": "1565832495197462753",
+    "comments": "1565832499190439977"
+   },
+   "lythroo/wavelength": {
+    "forum": "1565832502667517993"
+   }
+  },
+  "category": "1565832482383990917",
+  "dashboard": "1565832485697487033",
+  "dashboard_message": "1565832632435085425"
+ }
 }
