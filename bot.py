@@ -20,7 +20,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -36,6 +36,11 @@ except ImportError:
 GH_HOOK = os.getenv("GITHUB_WEBHOOK_URL", "").strip()
 CF_HOOK = os.getenv("CURSEFORGE_WEBHOOK_URL", "").strip()
 GH_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()   # Discord bot (forum posts for issues)
+FORUM_ID = os.getenv("ISSUES_FORUM_ID", "").strip()       # channel ID of the #github forum
+ON_CLOSE = os.getenv("ON_CLOSE", "archive").strip().lower()  # archive | mark | delete
+if ON_CLOSE not in ("archive", "mark", "delete"):
+    ON_CLOSE = "archive"
 POLL_MINUTES = float(os.getenv("POLL_MINUTES", "10"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() != "false"
 CF_MAX_SCROLLS = int(os.getenv("CF_MAX_SCROLLS", "12"))
@@ -192,7 +197,7 @@ def issue_embed(i: dict, name: str, repo: str) -> dict:
     }
 
 
-def sync_github(p: dict, ps: dict, save, backfill: bool) -> None:
+def sync_github_webhook(p: dict, ps: dict, save, backfill: bool) -> None:
     if not GH_HOOK:
         log.warning("GITHUB_WEBHOOK_URL not set, skipping GitHub")
         return
@@ -213,6 +218,315 @@ def sync_github(p: dict, ps: dict, save, backfill: bool) -> None:
             ps["github"].append(i["number"])
             save()
             log.info("%s: posted issue #%s", name, i["number"])
+
+
+# ----------------------------------------------------------------- Discord bot: one forum post per issue
+API = "https://discord.com/api/v10"
+BOT_MODE = bool(BOT_TOKEN and FORUM_ID)
+_forum: dict = {}
+_all_threads: dict = {}
+
+
+class Later(Exception):
+    """Discord told us to wait a long time. State is saved; the next run simply continues."""
+
+
+def gh_headers() -> dict:
+    h = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+    if GH_TOKEN:
+        h["Authorization"] = f"Bearer {GH_TOKEN}"
+    return h
+
+
+def dapi(method: str, path: str, **kw):
+    headers = {"Authorization": f"Bot {BOT_TOKEN}", "User-Agent": "DiscordBot (feedback-watcher, 1.0)"}
+    r = None
+    for _ in range(6):
+        try:
+            r = requests.request(method, API + path, headers=headers, timeout=25, **kw)
+        except requests.RequestException as e:
+            log.error("discord network error: %s", e)
+            time.sleep(3)
+            continue
+        if r.status_code == 429:
+            try:
+                wait = float(r.json().get("retry_after", 2))
+            except Exception:
+                wait = 2.0
+            if wait > 90:
+                raise Later(f"Discord rate limit ({int(wait)}s); continuing on the next run")
+            time.sleep(wait + 0.5)
+            continue
+        if r.status_code >= 500:
+            time.sleep(2)
+            continue
+        time.sleep(0.5)
+        return r
+    if r is None:
+        raise RuntimeError("Discord is unreachable")
+    return r
+
+
+def forum_info() -> dict:
+    if not _forum:
+        r = dapi("GET", f"/channels/{FORUM_ID}")
+        if r.status_code in (401, 403, 404):
+            raise RuntimeError(f"Bot can't see the forum channel (HTTP {r.status_code}). Check DISCORD_BOT_TOKEN, "
+                               "ISSUES_FORUM_ID and that the bot was invited to your server.")
+        r.raise_for_status()
+        ch = r.json()
+        if ch.get("type") not in (15, 16):
+            raise RuntimeError("ISSUES_FORUM_ID is not a forum channel")
+        _forum["tags"] = {t["name"].lower(): t["id"] for t in ch.get("available_tags", [])}
+        _forum["guild"] = ch.get("guild_id")
+    return _forum
+
+
+def tag_ids(*names: str) -> list[str]:
+    tags = forum_info()["tags"]
+    return [tags[n.lower()] for n in names if n.lower() in tags][:5]
+
+
+def create_post(title: str, embed: dict, tags: list[str]) -> str:
+    r = dapi("POST", f"/channels/{FORUM_ID}/threads", json={
+        "name": title[:100], "auto_archive_duration": 10080, "applied_tags": tags,
+        "message": {"embeds": [embed], "allowed_mentions": {"parse": []}},
+    })
+    if not r.ok:
+        raise RuntimeError(f"Discord refused to create the forum post (HTTP {r.status_code}): {r.text[:200]}")
+    return r.json()["id"]  # the first message of a forum post has the same id as the post
+
+
+def say(thread_id: str, content: str | None = None, embed: dict | None = None) -> bool:
+    payload = {"allowed_mentions": {"parse": []}}
+    if content:
+        payload["content"] = content
+    if embed:
+        payload["embeds"] = [embed]
+    return dapi("POST", f"/channels/{thread_id}/messages", json=payload).ok
+
+
+def notify_issues(p: dict, msg: str) -> bool:
+    title = f"⚠️ {p['name']} watcher alert"
+    if BOT_MODE:
+        try:
+            create_post(title, {"description": clip(msg, 3800), "color": 0xD29922}, tag_ids(p["name"]))
+            return True
+        except Exception as e:
+            log.error("could not post alert via bot: %s", e)
+    if GH_HOOK:
+        return post_webhook(GH_HOOK, "Watcher", content=msg, thread_name=title)
+    return False
+
+
+def forum_threads() -> list[dict]:
+    """All posts currently in the forum (active + archived), fetched once per run."""
+    if "all" in _all_threads:
+        return _all_threads["all"]
+    out: list[dict] = []
+    try:
+        r = dapi("GET", f"/guilds/{forum_info()['guild']}/threads/active")
+        if r.ok:
+            out += [t for t in r.json().get("threads", []) if t.get("parent_id") == FORUM_ID]
+        before = None
+        for _ in range(5):
+            params = {"limit": 100}
+            if before:
+                params["before"] = before
+            r = dapi("GET", f"/channels/{FORUM_ID}/threads/archived/public", params=params)
+            if not r.ok:
+                break
+            data = r.json()
+            ts = data.get("threads", [])
+            out += ts
+            if not data.get("has_more") or not ts:
+                break
+            before = ts[-1]["thread_metadata"]["archive_timestamp"]
+    except Exception as e:
+        log.warning("could not list existing forum posts: %s", e)
+    _all_threads["all"] = out
+    return out
+
+
+def adopt_threads(name: str) -> dict:
+    """Link posts made earlier by the webhook version: '[Name] #12 title' -> post id."""
+    pat = re.compile(rf"^\[{re.escape(name)}\] #(\d+) ")
+    return {m.group(1): t["id"] for t in forum_threads() if (m := pat.match(t.get("name", "")))}
+
+
+def gh_issue(repo: str, n) -> tuple[int, dict | None]:
+    r = requests.get(f"https://api.github.com/repos/{repo}/issues/{n}", headers=gh_headers(), timeout=30)
+    return r.status_code, (r.json() if r.ok else None)
+
+
+def _paged(url: str, params: dict, max_pages: int) -> list[dict]:
+    out = []
+    for page in range(1, max_pages + 1):
+        r = requests.get(url, params={**params, "per_page": 100, "page": page}, headers=gh_headers(), timeout=30)
+        r.raise_for_status()
+        items = r.json()
+        out += items
+        if len(items) < 100:
+            break
+    return out
+
+
+def fetch_issue_comments(repo: str, n) -> list[dict]:
+    return _paged(f"https://api.github.com/repos/{repo}/issues/{n}/comments", {}, 3)
+
+
+def fetch_repo_comments(repo: str, since: str) -> list[dict]:
+    return _paged(f"https://api.github.com/repos/{repo}/issues/comments",
+                  {"since": since, "sort": "created", "direction": "asc"}, 10)
+
+
+def gh_comment_embed(c: dict) -> dict:
+    return {
+        "title": "💬 New comment",
+        "url": c["html_url"],
+        "description": clip(c.get("body") or "*(empty)*", 3800),
+        "color": 0x768390,
+        "author": {"name": c["user"]["login"], "url": c["user"]["html_url"], "icon_url": c["user"]["avatar_url"]},
+        "timestamp": c["created_at"],
+        "footer": {"text": "GitHub comment"},
+    }
+
+
+def closed_embed(issue: dict, name: str, repo: str) -> dict:
+    e = issue_embed(issue, name, repo)
+    e["title"] = clip("✅ [CLOSED] " + e["title"], 256)
+    e["color"] = 0x6E7681 if issue.get("state_reason") == "not_planned" else 0x8957E5
+    return e
+
+
+def handle_closed(name: str, repo: str, n: str, tid: str, issue: dict | None, ps: dict) -> None:
+    threads, closed = ps["threads"], ps["closed"]
+    if ON_CLOSE == "delete":
+        r = dapi("DELETE", f"/channels/{tid}")
+        if not (r.ok or r.status_code == 404):
+            raise RuntimeError(f"couldn't delete the post for #{n} (HTTP {r.status_code}); does the bot have 'Manage Threads'?")
+        threads.pop(n, None)
+        log.info("%s: deleted post for closed issue #%s", name, n)
+        return
+    if issue:
+        dapi("PATCH", f"/channels/{tid}/messages/{tid}", json={"embeds": [closed_embed(issue, name, repo)]})
+        by = (issue.get("closed_by") or {}).get("login")
+        why = {"completed": "as completed", "not_planned": "as not planned", "duplicate": "as a duplicate"}.get(issue.get("state_reason") or "", "")
+        msg = "✅ Closed on GitHub" + (f" {why}" if why else "") + (f" by **{by}**" if by else "") + "."
+    else:
+        msg = "🗑️ This issue was removed from GitHub."
+    r = dapi("POST", f"/channels/{tid}/messages", json={"content": msg, "allowed_mentions": {"parse": []}})
+    if r.status_code == 404:  # somebody deleted the post by hand
+        threads.pop(n, None)
+        return
+    threads.pop(n, None)  # move first, so a failed archive below can never cause a second "closed" message
+    closed[n] = tid
+    patch = {"applied_tags": tag_ids(name, "Closed")}
+    if ON_CLOSE == "archive":
+        patch.update(archived=True, locked=True)
+    r = dapi("PATCH", f"/channels/{tid}", json=patch)
+    if not r.ok and r.status_code != 404:
+        raise RuntimeError(f"couldn't update the post for #{n} (HTTP {r.status_code}); does the bot have 'Manage Threads'?")
+    log.info("%s: closed issue #%s (%s)", name, n, ON_CLOSE)
+
+
+def handle_reopened(name: str, repo: str, issue: dict, n: str, tid: str, ps: dict) -> None:
+    ps["closed"].pop(n, None)
+    r = dapi("PATCH", f"/channels/{tid}", json={"archived": False, "locked": False, "applied_tags": tag_ids(name)})
+    if r.status_code == 404:
+        return
+    dapi("PATCH", f"/channels/{tid}/messages/{tid}", json={"embeds": [issue_embed(issue, name, repo)]})
+    say(tid, "🔄 Reopened on GitHub.")
+    ps["threads"][n] = tid
+    log.info("%s: reopened issue #%s", name, n)
+
+
+def sync_github_bot(p: dict, ps: dict, save, backfill: bool) -> None:
+    repo, name = p["github"], p["name"]
+    forum_info()  # fail early with a clear message if the bot/forum setup is wrong
+    started = (datetime.now(timezone.utc) - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    first = "github" not in ps
+    seen = set(ps.get("github", []))
+    threads = ps.setdefault("threads", {})
+    closed = ps.setdefault("closed", {})
+    comments_done = ps.setdefault("gh_comments", [])
+    issues = fetch_issues(repo)
+    open_nums = {i["number"] for i in issues}
+    log.info("%s / GitHub: %d open issues", name, len(issues))
+
+    # one-time: link forum posts that the earlier webhook version created
+    if "adopted" not in ps:
+        if seen:
+            for n, tid in adopt_threads(name).items():
+                if int(n) in seen and n not in threads:
+                    threads[n] = tid
+        ps["adopted"] = True
+        save()
+
+    # 1) new issues -> one forum post each (existing GitHub comments are copied in too)
+    new = [i for i in issues if i["number"] not in seen]
+    if first and not backfill:
+        ps["github"] = sorted(seen | {i["number"] for i in new})
+        save()
+    else:
+        ps.setdefault("github", [])
+        for i in new:
+            n = i["number"]
+            tid = create_post(f"[{name}] #{n} {i['title']}", issue_embed(i, name, repo), tag_ids(name))
+            ps["github"].append(n)
+            threads[str(n)] = tid
+            save()
+            log.info("%s: posted issue #%s", name, n)
+            if i.get("comments"):
+                for c in fetch_issue_comments(repo, n):
+                    if c["id"] not in comments_done and say(tid, embed=gh_comment_embed(c)):
+                        comments_done.append(c["id"])
+                save()
+
+    # 2) issues that were closed earlier but are open again
+    for n, tid in list(closed.items()):
+        issue = next((i for i in issues if i["number"] == int(n)), None)
+        if issue:
+            handle_reopened(name, repo, issue, n, tid, ps)
+            save()
+
+    # 3) tracked issues that are no longer open -> closed handling
+    for n, tid in list(threads.items()):
+        if int(n) in open_nums:
+            continue
+        code, issue = gh_issue(repo, n)
+        if code in (404, 410):
+            issue = None
+        elif code != 200 or issue.get("state") != "closed":
+            continue  # unclear right now, try again next run
+        handle_closed(name, repo, n, tid, issue, ps)
+        save()
+
+    # 4) new GitHub comments on open issues -> into their forum post
+    all_ok = True
+    since = ps.get("gh_since")
+    if since:
+        done = set(comments_done)
+        for c in fetch_repo_comments(repo, since):
+            n = c["issue_url"].rsplit("/", 1)[-1]
+            if c["id"] in done or n not in threads:
+                continue
+            if say(threads[n], embed=gh_comment_embed(c)):
+                comments_done.append(c["id"])
+                done.add(c["id"])
+            else:
+                all_ok = False
+    if all_ok:
+        ps["gh_since"] = started
+    ps["gh_comments"] = comments_done[-3000:]
+    save()
+
+
+def sync_github(p: dict, ps: dict, save, backfill: bool) -> None:
+    if BOT_MODE:
+        sync_github_bot(p, ps, save, backfill)
+    else:
+        sync_github_webhook(p, ps, save, backfill)
 
 
 # ----------------------------------------------------------------- CurseForge
@@ -410,17 +724,21 @@ def sync_curseforge(p: dict, ps: dict, save, backfill: bool) -> None:
 
 # ----------------------------------------------------------------- main
 def alert(p: dict, kind: str, ps: dict, err: Exception | None) -> None:
-    """Post ONE warning to the channel when a source starts failing; stay quiet until it recovers."""
+    """Post ONE warning when a source starts failing; stay quiet until it recovers."""
     key = f"alert_{kind}"
-    hook = GH_HOOK if kind == "github" else CF_HOOK
     if err is None:
         ps.pop(key, None)
-    elif hook and not ps.get(key):
-        label = "GitHub" if kind == "github" else "CurseForge"
-        msg = f"⚠️ {p['name']}: the {label} check is failing: {str(err)[:300]}\nI'll stay quiet until it works again."
-        thread = f"⚠️ {p['name']} watcher alert" if kind == "github" else None
-        if post_webhook(hook, "Watcher", content=msg, thread_name=thread):
-            ps[key] = True
+        return
+    if ps.get(key):
+        return
+    label = "GitHub" if kind == "github" else "CurseForge"
+    msg = f"⚠️ {p['name']}: the {label} check is failing: {str(err)[:300]}\nI'll stay quiet until it works again."
+    if kind == "github":
+        sent = notify_issues(p, msg)
+    else:
+        sent = bool(CF_HOOK) and post_webhook(CF_HOOK, "Watcher", content=msg)
+    if sent:
+        ps[key] = True
 
 
 def run_once(backfill: bool) -> None:
@@ -441,6 +759,10 @@ def run_once(backfill: bool) -> None:
             err = None
             try:
                 fn(p, ps, save, backfill)
+            except Later as e:
+                log.warning("%s / %s: %s", p["name"], kind, e)
+                save()
+                continue
             except Exception as e:  # one source failing must never stop the others
                 log.error("%s / %s check failed: %s", p["name"], kind, e)
                 err = e
@@ -462,13 +784,22 @@ def main() -> None:
     a = ap.parse_args()
 
     if a.test:
-        for hook, who in ((GH_HOOK, "Issues"), (CF_HOOK, "Comments")):
-            if hook:
-                ok = post_webhook(hook, f"Watcher · {who}", content="✅ Test message: webhook works.",
-                                  thread_name="Watcher test" if who == "Issues" else None)
-                print(who, "->", "ok" if ok else "FAILED")
-            else:
-                print(who, "-> webhook URL missing")
+        if BOT_MODE:
+            try:
+                tid = create_post("Watcher test", {"description": "✅ Bot works. Deleting this post again...", "color": 0x2DA44E}, [])
+                r = dapi("DELETE", f"/channels/{tid}")
+                print("Issues (bot) ->", "ok" if r.ok else f"created, but could not delete it (HTTP {r.status_code}): bot needs 'Manage Threads'")
+            except Exception as e:
+                print("Issues (bot) -> FAILED:", e)
+        elif GH_HOOK:
+            ok = post_webhook(GH_HOOK, "Watcher · Issues", content="✅ Test message: webhook works.", thread_name="Watcher test")
+            print("Issues (webhook) ->", "ok" if ok else "FAILED")
+        else:
+            print("Issues -> neither DISCORD_BOT_TOKEN+ISSUES_FORUM_ID nor a webhook set")
+        if CF_HOOK:
+            print("Comments ->", "ok" if post_webhook(CF_HOOK, "Watcher · Comments", content="✅ Test message: webhook works.") else "FAILED")
+        else:
+            print("Comments -> webhook URL missing")
         return
 
     if a.debug_curseforge is not None:
