@@ -1,6 +1,12 @@
 name: Watch mod feedback
 
 on:
+  push:
+    paths:
+      - "bot.py"
+      - "projects.json"
+      - "requirements.txt"
+      - ".github/workflows/watch.yml"
   schedule:
     - cron: "*/15 * * * *"   # every 15 minutes (GitHub may delay it a few minutes)
   workflow_dispatch:          # lets you start it manually from the Actions tab
