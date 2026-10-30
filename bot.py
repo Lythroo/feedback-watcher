@@ -103,12 +103,17 @@ def migrate_state(state: dict, first_key: str) -> None:
 
 
 # ----------------------------------------------------------------- discord
-def post_webhook(hook: str, username: str, embed: dict | None = None, content: str | None = None) -> bool:
+def post_webhook(hook: str, username: str, embed: dict | None = None, content: str | None = None,
+                 thread_name: str | None = None) -> bool:
+    """thread_name: required for forum channels (creates one post per call). If the channel turns out to be a
+    normal text channel and Discord rejects it, we retry once without it."""
     payload = {"username": username[:80], "allowed_mentions": {"parse": []}}
     if embed:
         payload["embeds"] = [embed]
     if content:
         payload["content"] = content
+    if thread_name:
+        payload["thread_name"] = thread_name[:100]
     for _ in range(6):
         try:
             r = requests.post(hook, json=payload, timeout=20)
@@ -127,6 +132,10 @@ def post_webhook(hook: str, username: str, embed: dict | None = None, content: s
         if r.ok:
             time.sleep(0.7)  # stay well under Discord's webhook rate limit
             return True
+        if r.status_code == 400 and "thread_name" in payload:
+            log.warning("webhook rejected thread_name (not a forum channel?), retrying as a normal message: %s", r.text[:200])
+            payload.pop("thread_name")
+            continue
         log.error("webhook rejected (%s): %s", r.status_code, r.text[:300])
         return False
     return False
@@ -199,7 +208,8 @@ def sync_github(p: dict, ps: dict, save, backfill: bool) -> None:
         return
     ps.setdefault("github", [])
     for i in new:
-        if post_webhook(GH_HOOK, f"{name} · Issues", embed=issue_embed(i, name, repo)):
+        thread = f"[{name}] #{i['number']} {i['title']}"  # forum channel: one post per issue
+        if post_webhook(GH_HOOK, f"{name} · Issues", embed=issue_embed(i, name, repo), thread_name=thread):
             ps["github"].append(i["number"])
             save()
             log.info("%s: posted issue #%s", name, i["number"])
@@ -408,7 +418,8 @@ def alert(p: dict, kind: str, ps: dict, err: Exception | None) -> None:
     elif hook and not ps.get(key):
         label = "GitHub" if kind == "github" else "CurseForge"
         msg = f"⚠️ {p['name']}: the {label} check is failing: {str(err)[:300]}\nI'll stay quiet until it works again."
-        if post_webhook(hook, "Watcher", content=msg):
+        thread = f"⚠️ {p['name']} watcher alert" if kind == "github" else None
+        if post_webhook(hook, "Watcher", content=msg, thread_name=thread):
             ps[key] = True
 
 
@@ -453,7 +464,9 @@ def main() -> None:
     if a.test:
         for hook, who in ((GH_HOOK, "Issues"), (CF_HOOK, "Comments")):
             if hook:
-                print(who, "->", "ok" if post_webhook(hook, f"Watcher · {who}", content="✅ Test message: webhook works.") else "FAILED")
+                ok = post_webhook(hook, f"Watcher · {who}", content="✅ Test message: webhook works.",
+                                  thread_name="Watcher test" if who == "Issues" else None)
+                print(who, "->", "ok" if ok else "FAILED")
             else:
                 print(who, "-> webhook URL missing")
         return
