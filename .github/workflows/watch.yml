@@ -1,5 +1,10 @@
 name: Watch mod feedback
 
+# GitHub can't schedule runs more often than every 5 minutes (and often runs them late),
+# so one run stays alive for a "shift" of almost 6 hours, checks every minute, and then
+# starts the next shift itself. The cron below is only a watchdog that restarts the chain
+# if it ever breaks (GitHub outage, manual cancel, ...).
+
 on:
   push:
     paths:
@@ -8,20 +13,45 @@ on:
       - "requirements.txt"
       - ".github/workflows/watch.yml"
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (GitHub may delay it a few minutes)
+    - cron: "*/30 * * * *"   # watchdog only: does nothing while a shift is running
   workflow_dispatch:          # lets you start it manually from the Actions tab
-
-concurrency:
-  group: watch
-  cancel-in-progress: false
 
 permissions:
   contents: write             # needed to save state.json (what was already posted)
+  actions: write              # needed to start the next shift
+
+env:
+  CHECK_EVERY_SECONDS: 60
+  SHIFT_MINUTES: 340          # GitHub kills jobs after 6 h; leave room for setup and hand-off
 
 jobs:
-  watch:
+  gate:
+    # Runs outside the concurrency group, so a watchdog tick can see a shift is
+    # already running and finish in seconds instead of queueing behind it.
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    outputs:
+      busy: ${{ steps.check.outputs.busy }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          busy=$(gh run list -R "$GITHUB_REPOSITORY" --workflow watch.yml --limit 20 \
+            --json databaseId,status \
+            -q "[.[] | select(.databaseId != $GITHUB_RUN_ID and (.status == \"in_progress\" or .status == \"queued\" or .status == \"waiting\" or .status == \"pending\"))] | length")
+          echo "busy=$busy" >> "$GITHUB_OUTPUT"
+
+  watch:
+    needs: gate
+    # Pushes and hand-offs always run (they queue behind the current shift);
+    # watchdog ticks only start a shift when none is alive.
+    if: github.event_name != 'schedule' || needs.gate.outputs.busy == '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    concurrency:
+      group: watch
+      # A push replaces the running shift so new code takes effect right away.
+      cancel-in-progress: ${{ github.event_name == 'push' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -35,7 +65,7 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Check GitHub issues and CurseForge comments
+      - name: Check GitHub issues and CurseForge comments every minute
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
@@ -46,17 +76,29 @@ jobs:
           CURSEFORGE_WEBHOOK_URL: ${{ secrets.COMMENTS_WEBHOOK }}
           GITHUB_TOKEN: ${{ github.token }}
           HEADLESS: "false"      # real (virtual-screen) browser passes Cloudflare more often
-        run: xvfb-run -a python bot.py --once
-
-      - name: Save state
-        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          if ! git diff --cached --quiet; then
-            git commit -m "update state"
-            git pull --rebase
-            git push
-          fi
 
+          # Saved after every check, so a cancelled shift never re-posts what was already sent.
+          save_state() {
+            git add state.json
+            git diff --cached --quiet && return 0
+            git commit -q -m "update state"
+            git pull -q --rebase && git push -q || echo "::warning::could not push state.json, retrying next check"
+          }
+
+          shift_end=$(( $(date +%s) + SHIFT_MINUTES * 60 ))
+          while [ "$(date +%s)" -lt "$shift_end" ]; do
+            started=$(date +%s)
+            xvfb-run -a python bot.py --once || echo "::warning::check failed, trying again next minute"
+            save_state
+            wait=$(( started + CHECK_EVERY_SECONDS - $(date +%s) ))
+            if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
+          done
+
+      - name: Start the next shift
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run watch.yml -R "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME"
