@@ -11,6 +11,7 @@ on:
       - "bot.py"
       - "projects.json"
       - "requirements.txt"
+      - "presence.py"
       - ".github/workflows/watch.yml"
   schedule:
     - cron: "*/30 * * * *"   # watchdog only: does nothing while a shift is running
@@ -87,6 +88,11 @@ jobs:
             git commit -q -m "update state"
             git pull -q --rebase && git push -q || echo "::warning::could not push state.json, retrying next check"
           }
+
+          # Shows the bot as online for exactly as long as this shift is checking.
+          python presence.py &
+          presence_pid=$!
+          trap 'kill -INT "$presence_pid" 2>/dev/null; wait "$presence_pid" 2>/dev/null || true' EXIT
 
           shift_end=$(( $(date +%s) + SHIFT_MINUTES * 60 ))
           while [ "$(date +%s)" -lt "$shift_end" ]; do
