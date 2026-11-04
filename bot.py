@@ -84,12 +84,13 @@ def project_key(p: dict) -> str:
 
 # ----------------------------------------------------------------- state
 def load_state() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text("utf-8"))
-        except Exception:
-            log.warning("state.json unreadable, starting fresh")
-    return {}
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text("utf-8"))
+    except (OSError, ValueError) as e:
+        # Starting fresh would re-post every issue and comment, so refuse instead.
+        sys.exit(f"state.json is unreadable ({e}); fix or delete it before running again.")
 
 
 def save_state(state: dict) -> None:

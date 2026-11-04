@@ -81,12 +81,26 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Saved after every check, so a cancelled shift never re-posts what was already sent.
+          # The checkout is the commit that triggered this run, which can be older than the
+          # state the previous shift pushed while this run was queued. Start from the newest.
+          git pull -q --rebase
+
+          # Saved after every check that delivered something, so a cancelled shift never re-posts.
           save_state() {
             git add state.json
-            git diff --cached --quiet && return 0
+            # Only "checked until" timestamps moved: not worth a commit, since the
+            # delivered-ID lists already stop a later shift from posting anything twice.
+            if ! git diff --cached -U0 state.json | grep '^[-+] ' | grep -qvE '"(gh_since|heartbeat)":'; then
+              return 0
+            fi
             git commit -q -m "update state"
-            git pull -q --rebase && git push -q || echo "::warning::could not push state.json, retrying next check"
+            # Only one shift runs at a time, so its state wins any conflict (-X theirs keeps
+            # the local commit during a rebase). Never leave a half-done rebase behind: its
+            # conflict markers would make state.json unreadable for the next check.
+            if ! { git pull -q --rebase --autostash -X theirs && git push -q; }; then
+              git rebase --abort 2>/dev/null || true
+              echo "::warning::could not push state.json, retrying next check"
+            fi
           }
 
           # Shows the bot as online for exactly as long as this shift is checking.
