@@ -12,7 +12,6 @@ Usage:
   python bot.py --debug-curseforge [NAME]   scrape one project's comments, save debug files, post nothing
 """
 import argparse
-import hashlib
 import html
 import json
 import logging
@@ -685,10 +684,15 @@ def sync_github(p: dict, ps: dict, save, backfill: bool) -> None:
 
 
 # ----------------------------------------------------------------- CurseForge
-TEXT_KEYS = ("content", "body", "text", "message", "comment", "commentText")
-AUTHOR_KEYS = ("author", "user", "username", "createdBy", "poster", "member", "owner")
-NAME_KEYS = ("username", "name", "displayName", "login")
-DATE_KEYS = ("createdAt", "dateCreated", "created", "datePosted", "createdDate", "postedAt", "date", "timestamp")
+# The comments page loads its comments from this endpoint; it is the only trusted source.
+# Guessing from other JSON or page text once posted the project header as a "comment".
+COMMENTS_API = re.compile(r"/api/v1/mods/\d+/comments\b")
+# A single slow page load is normal; this many misses in a row means something is really wrong.
+CF_MISSES_BEFORE_ALERT = 5
+
+
+class CommentsNotLoaded(RuntimeError):
+    """The comments page opened, but its comments request never arrived."""
 
 
 def clean_html(s: str) -> str:
@@ -697,75 +701,29 @@ def clean_html(s: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", html.unescape(s)).strip()
 
 
-def author_name(a) -> tuple[str | None, str | None]:
-    if isinstance(a, str):
-        return a, None
-    if isinstance(a, dict):
-        name = next((a[k] for k in NAME_KEYS if isinstance(a.get(k), str)), None)
-        avatar = next((a[k] for k in ("avatarUrl", "avatar", "avatar_url", "avatarURL") if isinstance(a.get(k), str)), None)
-        return name, avatar
-    return None, None
+def parse_comment(node: dict, reply_to: str | None) -> dict | None:
+    author = node.get("author") or {}
+    name = author.get("displayName") or author.get("username")
+    text = (node.get("text") or clean_html(node.get("body") or "")).strip()
+    if node.get("id") is None or not name or not text:
+        return None
+    posted = node.get("datePosted")
+    date = datetime.fromtimestamp(posted / 1000, tz=timezone.utc).isoformat() if isinstance(posted, (int, float)) else None
+    return {"id": str(node["id"]), "author": name, "avatar": author.get("twitchAvatarUrl"),
+            "text": text, "date": date, "reply_to": reply_to}
 
 
-def to_iso(v) -> str | None:
-    try:
-        if isinstance(v, (int, float)):
-            v = v / 1000 if v > 1e11 else v
-            return datetime.fromtimestamp(v, tz=timezone.utc).isoformat()
-        if isinstance(v, str):
-            datetime.fromisoformat(v.replace("Z", "+00:00"))
-            return v
-    except Exception:
-        pass
-    return None
-
-
-def walk_json(node, out: list, parent_author: str | None = None) -> None:
-    """Find comment-shaped objects (has text + author) anywhere in a JSON blob."""
-    if isinstance(node, dict):
-        text = next((node[k] for k in TEXT_KEYS if isinstance(node.get(k), str) and node[k].strip()), None)
-        akey = next((k for k in AUTHOR_KEYS if node.get(k)), None)
-        name, avatar = author_name(node[akey]) if akey else (None, None)
-        me = parent_author
-        if text and name:
-            date = next((to_iso(node[k]) for k in DATE_KEYS if node.get(k) is not None and to_iso(node[k])), None)
-            body = clean_html(text)
-            cid = str(node["id"]) if node.get("id") is not None else hashlib.sha1(f"{name}|{body}|{date}".encode()).hexdigest()[:16]
-            out.append({"id": cid, "author": name, "avatar": avatar, "text": body, "date": date, "reply_to": parent_author})
-            me = name
-        for v in node.values():
-            walk_json(v, out, me)
-    elif isinstance(node, list):
-        for v in node:
-            walk_json(v, out, parent_author)
-
-
-def dom_fallback(page) -> list[dict]:
-    """Last resort if no JSON response looked like comments: read visible text near author links."""
-    rows = page.evaluate(
-        """() => {
-          const res = [], seen = new Set();
-          for (const a of document.querySelectorAll('main a[href*="/members/"], #__next a[href*="/members/"]')) {
-            if (a.closest('header, nav, footer, aside')) continue;
-            const name = a.innerText.trim(); if (!name) continue;
-            let el = a;
-            for (let i = 0; i < 6 && el.parentElement; i++) {
-              el = el.parentElement;
-              if (el.innerText.trim().length > name.length + 20) break;
-            }
-            const txt = el.innerText.trim();
-            if (seen.has(txt)) continue; seen.add(txt);
-            res.push({name, txt});
-          }
-          return res;
-        }"""
-    )
+def parse_comments_response(data) -> list[dict]:
+    """Comments and their nested replies from one page of CurseForge's comments API."""
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        raise ValueError("unexpected CurseForge comments response")
     out = []
-    for r in rows:
-        body = r["txt"].replace(r["name"], "", 1).strip()
-        if body:
-            out.append({"id": hashlib.sha1(f"{r['name']}|{body}".encode()).hexdigest()[:16], "author": r["name"],
-                        "avatar": None, "text": body, "date": None, "reply_to": None})
+    for node in data["data"]:
+        top = parse_comment(node, None)
+        if not top:
+            continue
+        out.append(top)
+        out += filter(None, (parse_comment(r, top["author"]) for r in node.get("replies") or []))
     return out
 
 
@@ -811,18 +769,16 @@ def scrape_comments(cf_url: str, tag: str = "debug", debug: bool = False) -> lis
                 except Exception:
                     pass
 
-            preferred = [b for b in blobs if "comment" in b[0].lower()]
-            found: list[dict] = []
-            for _, data in preferred or blobs:
-                walk_json(data, found)
-            if not found:
-                log.warning("no comment JSON found, falling back to page text")
-                found = dom_fallback(page)
-
             if debug:
                 (BASE / f"debug_{tag}_comments.html").write_text(page.content(), "utf-8")
                 (BASE / f"debug_{tag}_network.json").write_text(
                     json.dumps([{"url": u, "data": d} for u, d in blobs], indent=1)[:5_000_000], "utf-8")
+
+            pages = [data for url, data in blobs if COMMENTS_API.search(url)]
+            if not pages:
+                # Slow load or a changed site: post nothing rather than guess from page text.
+                raise CommentsNotLoaded("CurseForge comments did not load")
+            found = [c for data in pages for c in parse_comments_response(data)]
         finally:
             ctx.close()
 
@@ -861,7 +817,14 @@ def sync_curseforge(p: dict, ps: dict, save, backfill: bool) -> None:
     url, name = p["curseforge"], p["name"]
     first = "curseforge" not in ps
     seen = set(ps.get("curseforge", []))
-    comments = scrape_comments(url, tag=re.sub(r"\W+", "_", name.lower()))
+    try:
+        comments = scrape_comments(url, tag=re.sub(r"\W+", "_", name.lower()))
+    except CommentsNotLoaded as e:
+        ps["cf_misses"] = ps.get("cf_misses", 0) + 1
+        if ps["cf_misses"] < CF_MISSES_BEFORE_ALERT:
+            raise Later(f"{e} ({ps['cf_misses']}x in a row); trying again next check") from e
+        raise
+    ps.pop("cf_misses", None)
     log.info("%s / CurseForge: %d comments found", name, len(comments))
     if not comments:
         raise RuntimeError("0 comments parsed (blocked by CurseForge, the page has no comments, or the layout changed)")
