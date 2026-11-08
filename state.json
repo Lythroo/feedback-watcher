@@ -92,7 +92,7 @@
     6720228448
    ],
    "adopted": true,
-   "gh_since": "2026-11-08T11:23:06Z",
+   "gh_since": "2026-11-08T17:12:59Z",
    "forum_comments": {
     "1565832489048744137": {
      "14": [
@@ -189,7 +189,7 @@
    "gh_comments": [],
    "adopted": true,
    "github": [],
-   "gh_since": "2026-11-08T11:23:19Z",
+   "gh_since": "2026-11-08T17:13:11Z",
    "curseforge": [
     "8139044",
     "8281566",
@@ -221,13 +221,14 @@
    "gh_comments": [],
    "adopted": true,
    "github": [],
-   "gh_since": "2026-11-08T11:23:31Z",
+   "gh_since": "2026-11-08T17:12:26Z",
    "forum_comments": {
     "1565832502667517993": {}
    },
    "forum_backfill_skipped": {
     "1565832502667517993": []
-   }
+   },
+   "alert_github": true
   }
  },
  "heartbeat": "2026-11-08",
