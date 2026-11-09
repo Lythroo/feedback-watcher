@@ -92,7 +92,7 @@
     6720228448
    ],
    "adopted": true,
-   "gh_since": "2026-11-09T22:04:13Z",
+   "gh_since": "2026-11-09T22:05:13Z",
    "forum_comments": {
     "1565832489048744137": {
      "14": [
@@ -182,7 +182,7 @@
      "8665908"
     ]
    },
-   "cf_misses": 9,
+   "cf_misses": 10,
    "alert_curseforge": true
   },
   "lythroo/falling-wind": {
@@ -191,7 +191,7 @@
    "gh_comments": [],
    "adopted": true,
    "github": [],
-   "gh_since": "2026-11-09T22:04:40Z",
+   "gh_since": "2026-11-09T22:05:26Z",
    "curseforge": [
     "8139044",
     "8281566",
@@ -216,7 +216,8 @@
      "a4739327c30aed8d"
     ]
    },
-   "cf_misses": 4
+   "cf_misses": 5,
+   "alert_curseforge": true
   },
   "lythroo/wavelength": {
    "threads": {},
@@ -224,7 +225,7 @@
    "gh_comments": [],
    "adopted": true,
    "github": [],
-   "gh_since": "2026-11-09T22:04:54Z",
+   "gh_since": "2026-11-09T22:05:39Z",
    "forum_comments": {
     "1565832502667517993": {}
    },
