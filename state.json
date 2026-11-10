@@ -94,7 +94,7 @@
     6720228448
    ],
    "adopted": true,
-   "gh_since": "2026-11-10T05:34:47Z",
+   "gh_since": "2026-11-10T06:40:50Z",
    "forum_comments": {
     "1565832489048744137": {
      "14": [
@@ -185,7 +185,8 @@
      "8677919",
      "8679735"
     ]
-   }
+   },
+   "alert_github": true
   },
   "lythroo/falling-wind": {
    "threads": {},
@@ -193,7 +194,7 @@
    "gh_comments": [],
    "adopted": true,
    "github": [],
-   "gh_since": "2026-11-10T05:35:01Z",
+   "gh_since": "2026-11-10T06:42:31Z",
    "curseforge": [
     "8139044",
     "8281566",
@@ -225,7 +226,7 @@
    "gh_comments": [],
    "adopted": true,
    "github": [],
-   "gh_since": "2026-11-10T05:35:12Z",
+   "gh_since": "2026-11-10T06:42:44Z",
    "forum_comments": {
     "1565832502667517993": {}
    },
