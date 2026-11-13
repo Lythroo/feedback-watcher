@@ -100,7 +100,7 @@
     6720228448
    ],
    "adopted": true,
-   "gh_since": "2026-11-13T03:00:30Z",
+   "gh_since": "2026-11-13T06:33:32Z",
    "forum_comments": {
     "1565832489048744137": {
      "14": [
@@ -201,7 +201,7 @@
    "gh_comments": [],
    "adopted": true,
    "github": [],
-   "gh_since": "2026-11-13T03:00:46Z",
+   "gh_since": "2026-11-13T06:33:44Z",
    "curseforge": [
     "8139044",
     "8281566",
@@ -228,12 +228,16 @@
    }
   },
   "lythroo/wavelength": {
-   "threads": {},
+   "threads": {
+    "6": "1570688656413425706"
+   },
    "closed": {},
    "gh_comments": [],
    "adopted": true,
-   "github": [],
-   "gh_since": "2026-11-13T03:00:59Z",
+   "github": [
+    6
+   ],
+   "gh_since": "2026-11-13T06:33:56Z",
    "forum_comments": {
     "1565832502667517993": {}
    },
