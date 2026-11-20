@@ -106,7 +106,7 @@
     6720228448
    ],
    "adopted": true,
-   "gh_since": "2026-11-19T17:27:20Z",
+   "gh_since": "2026-11-20T21:50:15Z",
    "forum_comments": {
     "1565832489048744137": {
      "14": [
@@ -207,7 +207,7 @@
    "gh_comments": [],
    "adopted": true,
    "github": [],
-   "gh_since": "2026-11-19T17:27:38Z",
+   "gh_since": "2026-11-20T21:49:27Z",
    "curseforge": [
     "8139044",
     "8281566",
@@ -231,7 +231,8 @@
      "8444824",
      "a4739327c30aed8d"
     ]
-   }
+   },
+   "alert_github": true
   },
   "lythroo/wavelength": {
    "threads": {
@@ -245,7 +246,7 @@
    "github": [
     6
    ],
-   "gh_since": "2026-11-19T17:27:50Z",
+   "gh_since": "2026-11-20T21:50:48Z",
    "forum_comments": {
     "1565832502667517993": {
      "6": [
@@ -258,7 +259,7 @@
    }
   }
  },
- "heartbeat": "2026-11-19",
+ "heartbeat": "2026-11-20",
  "discord": {
   "projects": {
    "lythroo/simple-blood": {
