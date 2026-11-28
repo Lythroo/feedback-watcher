@@ -147,7 +147,7 @@
     7238229654
    ],
    "adopted": true,
-   "gh_since": "2026-11-28T10:55:16Z",
+   "gh_since": "2026-11-28T14:28:20Z",
    "forum_comments": {
     "1565832489048744137": {
      "14": [
@@ -287,7 +287,7 @@
    "gh_comments": [],
    "adopted": true,
    "github": [],
-   "gh_since": "2026-11-28T10:55:31Z",
+   "gh_since": "2026-11-28T14:27:33Z",
    "curseforge": [
     "8139044",
     "8281566",
@@ -311,7 +311,8 @@
      "8444824",
      "a4739327c30aed8d"
     ]
-   }
+   },
+   "alert_github": true
   },
   "lythroo/wavelength": {
    "threads": {
@@ -325,7 +326,7 @@
    "github": [
     6
    ],
-   "gh_since": "2026-11-28T10:55:42Z",
+   "gh_since": "2026-11-28T14:28:45Z",
    "forum_comments": {
     "1565832502667517993": {
      "6": [
